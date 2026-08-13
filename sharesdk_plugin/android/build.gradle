@@ -1,32 +1,7 @@
 group 'com.mob.flutter.sharesdk'
 version '1.0-SNAPSHOT'
+
 apply plugin: 'com.android.library'
-
-buildscript {
-    repositories {
-        google()
-        jcenter()
-    }
-
-    dependencies {
-        classpath 'com.android.tools.build:gradle:3.6.0'
-    }
-    configurations.all {
-        resolutionStrategy.cacheDynamicVersionsFor 0, 'seconds'
-    }
-}
-
-rootProject.allprojects {
-    repositories {
-        google()
-        jcenter()
-    }
-}
-
-
-dependencies {
-    compileOnly fileTree(include: ['*.jar','*.aar'], dir: 'libs',excludes: [])
-}
 
 def localProperties = new Properties()
 def localPropertiesFile = rootProject.file('local.properties')
@@ -51,51 +26,46 @@ if (flutterVersionName == null) {
     flutterVersionName = '1.0'
 }
 
-
-def mobCompileSdkVersion = 31
+def mobCompileSdkVersion = 34
 try {
     mobCompileSdkVersion = flutter.compileSdkVersion
     if (rootProject.hasProperty("zzt-compileSdkVersion")) {
         mobCompileSdkVersion = Integer.parseInt(rootProject.getProperty('zzt-compileSdkVersion'))
     }
-} catch (Throwable throwable) {
-
+} catch (Throwable ignored) {
 }
 
-def mobTargetSdkVersion = 31
+def mobTargetSdkVersion = 34
 try {
     mobTargetSdkVersion = flutter.targetSdkVersion
     if (rootProject.hasProperty("zzt-targetSdkVersion")) {
-        mobTargetSdkVersion = Integer.parseInt(rootProject.getProperty('zzt-compileSdkVersion'))
+        mobTargetSdkVersion = Integer.parseInt(rootProject.getProperty('zzt-targetSdkVersion'))
     }
-} catch (Throwable throwable) {
-
+} catch (Throwable ignored) {
 }
 
 android {
-    compileSdkVersion mobCompileSdkVersion
-    buildToolsVersion '30.0.0'
-    if (project.android.hasProperty("namespace")) {
-        namespace 'com.mob.flutter.sharesdk'
-    }
+    namespace 'com.mob.flutter.sharesdk'
+    compileSdk mobCompileSdkVersion
 
-    lintOptions {
+    lint {
         disable 'InvalidPackage'
     }
 
     defaultConfig {
-        minSdkVersion 16
-        targetSdkVersion mobTargetSdkVersion
+        minSdk 16
+        targetSdk mobTargetSdkVersion
         versionCode flutterVersionCode.toInteger()
         versionName flutterVersionName
     }
 
     buildTypes {
         release {
-            // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig signingConfigs.debug
         }
     }
 }
 
-
+dependencies {
+    compileOnly fileTree(include: ['*.jar', '*.aar'], dir: 'libs', excludes: [])
+}

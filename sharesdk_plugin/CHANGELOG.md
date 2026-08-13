@@ -133,3 +133,12 @@
 
 ## 1.3.20
 * 1. support Wechat AuthCode
+
+## 1.3.20+ohos.1
+* 1. 新增鸿蒙 (HarmonyOS NEXT) 平台支持：`ohos/` ArkTS 插件模块，支持微信、QQ、华为三个平台的授权 / 分享 / 用户信息 / 小程序等能力
+* 2. 新增 `SharesdkPlugin.getBundleSignatureFingerprint()`，用于获取鸿蒙应用签名 fingerprint 及 MD5（QQ 互联平台配置需要）
+* 3. `uploadPrivacyPermissionStatus` 新增可选参数 `appKey` / `appSecret`，并对通道调用失败做静默处理
+* 4. `SSDKError` 增加可读的 `toString()`
+* 5. 修复 `dynamic?` 非法可空类型写法
+* 6. Android：移除已下线的 `jcenter()` 与 AGP 3.6 buildscript，改用 `namespace` / `compileSdk 34` / `lint` 新语法
+* 7. iOS：podspec 默认仅保留 WeChat / QQ / SMS 三个平台，其余平台依赖已注释，按需自行放开

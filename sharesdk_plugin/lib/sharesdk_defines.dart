@@ -3,14 +3,30 @@ import 'package:flutter/foundation.dart';
 enum SSDKResponseState { Success, Fail, Cancel, Unknown }
 
 class SSDKError extends Error {
-  final dynamic? rawData;
+  final dynamic rawData;
   final int? code;
-  final dynamic? userInfo;
+  final dynamic userInfo;
 
   SSDKError({this.rawData})
       : code = rawData != null ? rawData["code"] : 0,
         userInfo = rawData != null ? rawData["userInfo"] : {},
         super();
+
+  /// 返回可读的错误描述，便于调试
+  @override
+  String toString() {
+    if (rawData == null) return 'SSDKError(null)';
+    if (rawData is Map) {
+      final m = rawData as Map;
+      final msg = m['message'] ?? m['msg'] ?? m['errorMsg'];
+      final c = m['code'];
+      if (msg != null && msg.toString().isNotEmpty) {
+        return 'SSDKError(code: $c, message: $msg)';
+      }
+      if (c != null) return 'SSDKError(code: $c)';
+    }
+    return 'SSDKError(rawData: $rawData)';
+  }
 }
 
 class ShareSDKMethod {
@@ -56,6 +72,8 @@ class ShareSDKMethods {
       ShareSDKMethod(name: 'shareWithActivity', id: 16);
   static final ShareSDKMethod getSharedFilePath =
       ShareSDKMethod(name: 'targetFilePath', id: 17);
+  static final ShareSDKMethod getBundleSignatureFingerprint =
+      ShareSDKMethod(name: 'getBundleSignatureFingerprint', id: 18);
 }
 
 class ShareSDKPlatform {

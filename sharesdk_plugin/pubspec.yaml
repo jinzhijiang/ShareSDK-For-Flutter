@@ -1,6 +1,6 @@
 name: sharesdk_plugin
 description: ShareSDK is a social sharing component that provides social functions for apps, like authorization and share, and has social statistical analysis management background.
-version: 1.3.20
+version: 1.3.20+ohos.1
 homepage: http://www.mob.com/mobService/sharesdk
 
 environment:
@@ -21,6 +21,8 @@ flutter:
         package: com.mob.flutter.sharesdk
         pluginClass: SharesdkPlugin
       ios:
+        pluginClass: SharesdkPlugin
+      ohos:
         pluginClass: SharesdkPlugin
 
 false_secrets:

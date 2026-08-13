@@ -143,6 +143,146 @@ MobSDK {
 }
 ```
 
+### 鸿蒙 HarmonyOS NEXT
+
+本分支额外提供了鸿蒙实现（`ohos/` 目录，ArkTS 编写，底层依赖 ohpm 上的 `@zztsdk/sharesdk` 与 `@zztsdk/zztcore`）。
+需要使用支持鸿蒙的 Flutter SDK（[openharmony-sig/flutter_flutter](https://gitcode.com/openharmony-sig/flutter_flutter)）。
+
+#### 支持范围
+
+| 能力 | 鸿蒙支持情况 |
+| --- | --- |
+| 平台 | 微信（`wechatSession` 22 / `wechatTimeline` 23 / `weChatFavorites` 37 / `wechatSeries` 997）、QQ（`qq` 24 / `qZone` 6 / `qqSeries` 998）、华为帐号（`HWAccount` 63） |
+| 接口 | `getVersion`、`regist`、`auth`、`getUserInfo`、`hasAuthed`、`cancelAuth`、`share`、`shareWithActivity`、`showEditor`、`showMenu`、`openMiniProgram`、`isClientInstalled`、`activePlatforms`、`uploadPrivacyPermissionStatus`、`targetFilePath` |
+| 空实现 | `setAllowShowPrivacyWindow`、`setPrivacyUI`（鸿蒙侧无隐私弹窗 UI，直接返回成功） |
+| 未支持 | `getPrivacyPolicy`（返回 error）；其余未在上表列出的平台调用会返回 `state = 2` 并带 `unsupported platform` |
+| 额外接口 | `getBundleSignatureFingerprint()`，见下文 |
+
+#### 一、引入插件
+
+```yaml
+dependencies:
+  sharesdk_plugin:
+    git:
+      url: https://github.com/jinzhijiang/ShareSDK-For-Flutter.git
+      path: sharesdk_plugin
+```
+
+也可以直接把 `sharesdk_plugin` 放到工程的 `packages/` 下用 `path:` 引用。
+
+#### 二、配置鸿蒙工程
+
+以下三处需要手工添加（鸿蒙 Flutter 工具链目前只会自动生成 `GeneratedPluginRegistrant.ets`，不会自动注册模块）。
+下面的路径以「插件放在工程 `packages/sharesdk_plugin` 下」为例，用 git 依赖时改成 pub-cache 中的实际路径即可。
+
+**1. `ohos/oh-package.json5`**
+
+```json5
+{
+  "dependencies": {
+    "sharesdk_plugin": "file:../packages/sharesdk_plugin/ohos"
+  },
+  // 必须：插件里 @ohos/flutter_ohos 声明的是相对自身目录的默认路径，
+  // 这里用 overrides 指向工程内真实的 flutter.har，overrides 会覆盖插件的声明（即使插件里那个路径不存在）
+  "overrides": {
+    "@ohos/flutter_ohos": "file:./har/flutter.har"
+  }
+}
+```
+
+**2. `ohos/entry/oh-package.json5`**
+
+```json5
+{
+  "dependencies": {
+    "sharesdk_plugin": "file:../../packages/sharesdk_plugin/ohos"
+  }
+}
+```
+
+**3. `ohos/build-profile.json5`** 的 `modules` 数组中追加：
+
+```json5
+{
+  "name": "sharesdk_plugin",
+  "srcPath": "../packages/sharesdk_plugin/ohos",
+  "targets": [
+    { "name": "default", "applyToProducts": ["default"] }
+  ]
+}
+```
+
+#### 三、EntryAbility 中初始化
+
+插件本身不内置任何 Mob 凭据，appKey / appSecret 由宿主 App 传入：
+
+```typescript
+import { SharesdkPlugin } from 'sharesdk_plugin';
+
+export default class EntryAbility extends FlutterAbility {
+  onCreate(want: Want, launchParam: AbilityConstant.LaunchParam) {
+    SharesdkPlugin.setUIAbilityContext(this.context, '你的MobAppKey', '你的MobAppSecret');
+    SharesdkPlugin.handleWant(want, this.context);
+    super.onCreate(want, launchParam);
+  }
+
+  // 第三方 App 授权/分享后会以 newWant 回到本 Ability，必须转交给插件处理回调
+  onNewWant(want: Want, launchParam: AbilityConstant.LaunchParam) {
+    SharesdkPlugin.handleWant(want, this.context);
+    super.onNewWant(want, launchParam);
+  }
+}
+```
+
+若不方便在 EntryAbility 传凭据，也可以在 Dart 侧调用
+`SharesdkPlugin.uploadPrivacyPermissionStatus(1, cb, appKey: ..., appSecret: ...)` 时传入，插件会在那时完成初始化。
+两处都不传会抛出提示信息明确的异常。
+
+#### 四、`ohos/entry/src/main/module.json5`
+
+```json5
+{
+  "module": {
+    // isClientInstalled 需要用 canOpenLink 探测微信/QQ 是否安装
+    "querySchemes": ["weixin", "mqqapi", "qqopenapi", "https"],
+    // 网页分享缩略图需要联网下载并压缩
+    "requestPermissions": [
+      { "name": "ohos.permission.INTERNET" }
+    ]
+  }
+}
+```
+
+#### 五、Dart 侧用法
+
+与 Android / iOS 完全一致，平台参数信息用字符串 key 的 map 下发：
+
+```dart
+SharesdkRegister register = SharesdkRegister();
+register.setupWechat('微信AppID', '微信AppSecret', ''); // 第三参为 iOS UniversalLink，鸿蒙忽略
+register.setupQQ('QQAppID', 'QQAppKey');
+SharesdkPlugin.regist(register);
+
+// Release 包在调用 isClientInstalled / 分享前需先提交隐私授权
+await SharesdkPlugin.uploadPrivacyPermissionStatus(1, (bool success) {},
+    appKey: '你的MobAppKey', appSecret: '你的MobAppSecret');
+```
+
+#### 六、获取鸿蒙签名指纹（配置 QQ 互联用）
+
+腾讯开放平台配置鸿蒙应用需要填写签名指纹的 MD5，可用插件内置方法取得：
+
+```dart
+final info = await SharesdkPlugin.getBundleSignatureFingerprint();
+// { 'fingerprint': '...', 'fingerprintMd5': '...', 'bundleName': '...' }
+```
+
+#### 已知差异
+
+- 鸿蒙侧 `getUserInfo` / `auth` 成功时，用户信息放在 `user['raw']` 中（ShareSDK 的 `db.exportData()` 原始内容），与 Android / iOS 的字段结构不同，业务侧需自行解析。
+- 微信网页分享的缩略图会由插件下载并压缩到 64KB 以内（微信 `thumbData` 限制），因此需要 `ohos.permission.INTERNET`。
+- `targetFilePath` 只回传文件名，实际落盘路径由业务方自行处理。
+
 ## 接口方法说明
 接口详情：[API接口调用](https://www.mob.com/wiki/detailed?wiki=31&id=14)
 

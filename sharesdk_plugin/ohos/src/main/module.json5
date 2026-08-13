@@ -1,0 +1,11 @@
+{
+  "module": {
+    "name": "sharesdk_plugin",
+    "type": "har",
+    "description": "ShareSDK OHOS plugin for HarmonyOS NEXT",
+    "deviceTypes": [
+      "phone",
+      "tablet"
+    ]
+  }
+}

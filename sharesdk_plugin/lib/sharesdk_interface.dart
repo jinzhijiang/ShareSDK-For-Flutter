@@ -13,8 +13,13 @@ class SharesdkPlugin {
       const EventChannel('com.mob.sharesdk.restorereceiver');
 
   static Future<dynamic> regist(ShareSDKRegister register) async {
+    // 转为 string key，确保鸿蒙等平台能正确解析
+    final Map<String, dynamic> platformsInfo = {};
+    register.platformsInfo.forEach((k, v) {
+      platformsInfo[k.toString()] = v;
+    });
     return await _channel.invokeMethod(
-        ShareSDKMethods.regist.name!, register.platformsInfo);
+        ShareSDKMethods.regist.name!, platformsInfo);
   }
 
   static Future<dynamic> targetFilePath(
@@ -195,7 +200,7 @@ class SharesdkPlugin {
   }
 
   static Future<dynamic> getPrivacyPolicy(String type, String? language,
-      Function(dynamic? data, dynamic error) result) {
+      Function(dynamic data, dynamic error) result) {
     Map args = {"type": type};
     if (language != null) {
       args["language"] = language;
@@ -211,14 +216,24 @@ class SharesdkPlugin {
   }
 
   static Future<dynamic> uploadPrivacyPermissionStatus(
-      int status, Function(bool success) result) {
+      int status, Function(bool success) result,
+      {String? appKey, String? appSecret}) {
     Map args = {"status": status};
+    if (appKey != null && appKey.isNotEmpty) {
+      args["appKey"] = appKey;
+    }
+    if (appSecret != null && appSecret.isNotEmpty) {
+      args["appSecret"] = appSecret;
+    }
     Future<dynamic> callback = _channel.invokeMethod(
         ShareSDKMethods.uploadPrivacyPermissionStatus.name!, args);
     callback.then((dynamic response) {
       if (result != null) {
         result(response["success"]);
       }
+    }).catchError((Object _) {
+      // 通道未实现/调用失败时静默处理，避免未处理的异步异常上报为崩溃。
+      // 调用方仍可通过 await 的 try/catch 感知失败。
     });
     return callback;
   }
@@ -242,6 +257,17 @@ class SharesdkPlugin {
     Map args = {"platform": platform.id};
     return await _channel.invokeMethod(
         ShareSDKMethods.isClientInstalled.name!, args);
+  }
+
+  /// 获取鸿蒙应用签名 fingerprint 及 MD5（用于 QQ 互联平台配置）
+  static Future<Map<String, String>?> getBundleSignatureFingerprint() async {
+    final result = await _channel.invokeMethod(
+        ShareSDKMethods.getBundleSignatureFingerprint.name!);
+    if (result is Map) {
+      return Map<String, String>.from(result.map(
+          (k, v) => MapEntry(k.toString(), v?.toString() ?? '')));
+    }
+    return null;
   }
 
   static SSDKResponseState _state(Map response) {

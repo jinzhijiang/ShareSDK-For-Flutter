@@ -1,0 +1,18 @@
+{
+  "name": "sharesdk_plugin",
+  "version": "1.0.0",
+  "description": "ShareSDK OHOS plugin for HarmonyOS NEXT.",
+  "main": "index.ets",
+  "author": "",
+  "license": "Apache-2.0",
+  // @ohos/flutter_ohos 默认按「插件目录内自带 har」解析。
+  // 宿主工程通常不会把 har 放进插件目录，而是在自己的 ohos/oh-package.json5 里用
+  // overrides 指向工程内真实的 flutter.har，overrides 会覆盖这里声明的路径（即使此路径不存在）：
+  //   "overrides": { "@ohos/flutter_ohos": "file:./har/flutter.har" }
+  // 详见本仓库 README 的「鸿蒙(HarmonyOS)接入」一节。
+  "dependencies": {
+    "@ohos/flutter_ohos": "file:./har/flutter.har",
+    "@zztsdk/zztcore": "latest",
+    "@zztsdk/sharesdk": "latest"
+  }
+}
