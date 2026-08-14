@@ -102,15 +102,21 @@ public class SharesdkPlugin implements FlutterPlugin,MethodCallHandler, Activity
           getUserInfoWithArgs(call, result);
           break;
         case PluginMethodRegist:
+          // Android 侧平台参数走 assets/ShareSDK.xml（MobSDK gradle 插件生成），
+          // 这里无事可做——但**必须应答**：Dart 侧 regist() 返回的是 invokeMethod 的
+          // Future，不回 result 就永远不完成，调用方 await 它会静默挂死。
           Log.e("SharesdkPlugin", "PluginMethodRegist");
+          onResultSuccess(result, noopResult("regist is a no-op on Android"));
           break;
         case PluginMethodActivePlatforms:
           //IOS only
           Log.e("SharesdkPlugin", "PluginMethodActivePlatforms IOS only");
+          onResultSuccess(result, noopResult("activePlatforms is iOS only"));
           break;
         case PluginMethodShowEditor:
           //IOS only
           Log.e("SharesdkPlugin", "PluginMethodShowEditor IOS only");
+          onResultSuccess(result, noopResult("showEditor is iOS only"));
           break;
         case PluginMethodShowMenu:
           Log.e("SharesdkPlugin", "PluginMethodShowMenu");
@@ -134,12 +140,34 @@ public class SharesdkPlugin implements FlutterPlugin,MethodCallHandler, Activity
           break;
         default:
           Log.e("SharesdkPlugin", "default");
+          // 未实现的方法要显式告知，否则 Dart 侧同样是无限期挂起
+          if (result != null) {
+            result.notImplemented();
+          }
           break;
       }
-    } catch (Exception e) {
-      Log.e("SharesdkPlugin","Error" + e);
-      e.printStackTrace();
+    } catch (Throwable e) {
+      // 这里原本只打日志、不应答——任何一个 handler 抛异常，Dart 侧的 Future
+      // 就永远不完成，业务代码卡在 await 上且没有任何错误可捕获。
+      // catch Throwable 而非 Exception：Error（如 NoClassDefFoundError，
+      // 缺某个平台 SDK 时很常见）同样会让调用方挂死。
+      Log.e("SharesdkPlugin", "Error" + e);
+      if (result != null) {
+        try {
+          result.error("SHARESDK_ERROR", String.valueOf(e.getMessage()), null);
+        } catch (Throwable ignored) {
+          // handler 已经应答过了，这里重复应答会抛，忽略即可
+        }
+      }
     }
+  }
+
+  /** 无实际动作但必须应答的方法的统一返回体 */
+  private Map<String, Object> noopResult(String reason) {
+    final Map<String, Object> map = new HashMap<>();
+    map.put("state", "noop");
+    map.put("reason", reason);
+    return map;
   }
 
 
@@ -635,21 +663,40 @@ public class SharesdkPlugin implements FlutterPlugin,MethodCallHandler, Activity
   /**
    * 判断客户端是否有效
    **/
+  /**
+   * 客户端是否已安装。
+   *
+   * <p>本方法的每一条出口都必须应答 result。原实现有三个洞会让 Dart 侧永久挂起：
+   * 平台名未知时 {@code getPlatform} 返回 null 直接 NPE；异步重载自身抛出时无人应答；
+   * 回调里 {@code Boolean} 为 null 时拆箱 NPE。平台配置不全（典型如微信缺 appSecret）
+   * 会稳定触发第二条——表现为「点分享毫无反应，连报错都没有」。
+   */
   private void isClientInstalled(MethodCall call, final Result result) {
     HashMap<String, Object> map = call.arguments();
     String num = String.valueOf(map.get("platform"));
     String platName = Utils.platName(num);
     Platform platform = ShareSDK.getPlatform(platName);
+    if (platform == null) {
+      Log.e(TAG, "isClientInstalled: unknown platform " + num + " -> " + platName);
+      installedCallback(false, result);
+      return;
+    }
     try {
       boolean clientValid = platform.isClientValid();
       installedCallback(clientValid, result);
     } catch (Throwable t) {
-      platform.isClientValid(new ShareSDKCallback<Boolean>() {
-        @Override
-        public void onCallback(Boolean aBoolean) {
-          installedCallback(aBoolean, result);
-        }
-      });
+      // 同步重载不可用，退到异步重载；它自己也可能抛，必须再兜一层
+      try {
+        platform.isClientValid(new ShareSDKCallback<Boolean>() {
+          @Override
+          public void onCallback(Boolean aBoolean) {
+            installedCallback(aBoolean != null && aBoolean, result);
+          }
+        });
+      } catch (Throwable inner) {
+        Log.e(TAG, "isClientInstalled failed: " + inner);
+        installedCallback(false, result);
+      }
     }
   }
 
