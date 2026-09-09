@@ -13,6 +13,9 @@
   "dependencies": {
     "@ohos/flutter_ohos": "file:./har/flutter.har",
     "@zztsdk/zztcore": "latest",
-    "@zztsdk/sharesdk": "latest"
+    "@zztsdk/sharesdk": "latest",
+    // 微信授权码这条路直连微信官方 SDK（见 SharesdkPlugin.ets 的 WechatAuthCodeSession）。
+    // 它本来就是 @zztsdk/sharesdk 的传递依赖，这里显式声明只是为了能直接 import。
+    "@tencent/wechat_open_sdk": "1.0.16"
   }
 }

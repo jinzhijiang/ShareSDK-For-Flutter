@@ -156,6 +156,7 @@ MobSDK {
 | 接口 | `getVersion`、`regist`、`auth`、`getUserInfo`、`hasAuthed`、`cancelAuth`、`share`、`shareWithActivity`、`showEditor`、`showMenu`、`openMiniProgram`、`isClientInstalled`、`activePlatforms`、`uploadPrivacyPermissionStatus`、`targetFilePath` |
 | 空实现 | `setAllowShowPrivacyWindow`、`setPrivacyUI`（鸿蒙侧无隐私弹窗 UI，直接返回成功） |
 | 未支持 | `getPrivacyPolicy`（返回 error）；其余未在上表列出的平台调用会返回 `state = 2` 并带 `unsupported platform` |
+| 微信授权码 | `getUserInfo` / `auth` 传 `{'needAuthCode': true}` 时走微信官方 SDK 取原始 code，见下文「五之二」 |
 | 额外接口 | `getBundleSignatureFingerprint()`，见下文 |
 
 #### 一、引入插件
@@ -258,15 +259,57 @@ export default class EntryAbility extends FlutterAbility {
 与 Android / iOS 完全一致，平台参数信息用字符串 key 的 map 下发：
 
 ```dart
+// ⚠️ 顺序不能反：先提交隐私授权，再 regist。
+// 底层 ShareSDK.setPlatformDevInfoAsync 开头会 await MobCommon.isForbiddenAsync()，
+// 未授权时**默默丢弃**整个 devInfo（只打一行 `isForbidden use Platform.DEFAULT`），
+// 之后 initPlatform 抛 `Platform DevInfo null`，表现为微信 / QQ 全都用不了。
+await SharesdkPlugin.uploadPrivacyPermissionStatus(1, (bool success) {},
+    appKey: '你的MobAppKey', appSecret: '你的MobAppSecret');
+
 SharesdkRegister register = SharesdkRegister();
 register.setupWechat('微信AppID', '微信AppSecret', ''); // 第三参为 iOS UniversalLink，鸿蒙忽略
 register.setupQQ('QQAppID', 'QQAppKey');
-SharesdkPlugin.regist(register);
-
-// Release 包在调用 isClientInstalled / 分享前需先提交隐私授权
-await SharesdkPlugin.uploadPrivacyPermissionStatus(1, (bool success) {},
-    appKey: '你的MobAppKey', appSecret: '你的MobAppSecret');
+await SharesdkPlugin.regist(register);
 ```
+
+微信的 appSecret 在鸿蒙上**必须非空**：`WechatPlatform.initPlatform` 里
+`isTextEmpty(appKey) || isTextEmpty(appSecret)` 就抛
+`wechat init fail,please check appKey and appSecret`。若你的服务端走授权码流、
+不希望把真 AppSecret 打进客户端，填一个占位串即可（分享路径不会用到它），
+授权改用下一节的 `needAuthCode`。
+
+#### 五之二、微信取**原始授权码**（`needAuthCode`）
+
+服务端走微信授权码流（自己持 appid+secret 调 `sns/oauth2/access_token`）时，客户端要交的是
+原始 `code` 而不是 access_token。Android 用 `needAuthCode` 开关即可，鸿蒙则不行——底层
+`@zztsdk/sharesdk` 的微信授权回包里，拿到 code 之后是**无条件**
+`requestAuthToken(appId, appSecret, code)` 换 token，原始 code 从不落 db。
+
+所以本插件在鸿蒙侧对**微信 + `needAuthCode: true`** 这一种组合做了单独实现：绕开 ShareSDK，
+直接用微信官方 `@tencent/wechat_open_sdk` 发 `SendAuthReq`，回包里的 `code` 原样返回。
+这条路只需要 appId，不读 appSecret。
+
+```dart
+SharesdkPlugin.getUserInfoWithParam(
+  ShareSDKPlatforms.wechatSession,
+  {'needAuthCode': true},
+  (SSDKResponseState state, user, SSDKError error) {
+    // 鸿蒙成功时：user = {'authCode': '<原始 code>', 'openid': '...'}
+  },
+);
+```
+
+不传 `needAuthCode` 时行为完全不变，仍走 ShareSDK 的 `showUser()`，老接入方不受影响。
+
+实现细节与注意点：
+
+- 授权请求经 `startAbility` 拉起微信，回包走 `onNewWant`，所以 **EntryAbility 的
+  `onNewWant` 必须转交 `SharesdkPlugin.handleWant`**（见上文第三节）——插件会先让
+  微信授权会话认领这条 want，认领不了才转给 ShareSDK。
+- 宿主 `querySchemes` 里若额外声明了 `wxopensdk`，微信 SDK 会改走 `openLink` 直接回调
+  （少一次「想要打开微信」的系统确认弹窗）；两条路插件都已处理。
+- 同一时刻只允许一个进行中的微信授权；再发一次会把上一次按**取消**结算。
+- 用户跳到微信后一直不回来时，180 秒后按**取消**结算，避免调用方的 Future 永远挂着。
 
 #### 六、获取鸿蒙签名指纹（配置 QQ 互联用）
 
@@ -279,7 +322,8 @@ final info = await SharesdkPlugin.getBundleSignatureFingerprint();
 
 #### 已知差异
 
-- 鸿蒙侧 `getUserInfo` / `auth` 成功时，用户信息放在 `user['raw']` 中（ShareSDK 的 `db.exportData()` 原始内容），与 Android / iOS 的字段结构不同，业务侧需自行解析。
+- 鸿蒙侧 `getUserInfo` / `auth` 成功时，用户信息放在 `user['raw']` 中（ShareSDK 的 `db.exportData()` 原始内容，JSON 字符串；键名如 `token` / `openID` / `unionID`），与 Android / iOS 的字段结构不同，业务侧需自行解析。
+  **例外**：微信 + `needAuthCode: true` 走的是官方 SDK 那条路，返回的是 `{'authCode': ..., 'openid': ...}`，没有 `raw`。
 - 微信网页分享的缩略图会由插件下载并压缩到 64KB 以内（微信 `thumbData` 限制），因此需要 `ohos.permission.INTERNET`。
 - `targetFilePath` 只回传文件名，实际落盘路径由业务方自行处理。
 

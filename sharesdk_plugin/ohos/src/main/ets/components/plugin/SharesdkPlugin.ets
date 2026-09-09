@@ -16,6 +16,16 @@ import http from '@ohos.net.http';
 import { image } from '@kit.ImageKit';
 import { ZztSDK } from '@zztsdk/zztcore';
 import mobShare from '@zztsdk/sharesdk';
+import {
+  BaseReq,
+  BaseResp,
+  ErrCode,
+  SendAuthReq,
+  SendAuthResp,
+  WXAPIFactory,
+  WXApi,
+  WXApiEventHandler,
+} from '@tencent/wechat_open_sdk';
 
 const METHOD_CHANNEL_NAME = 'com.mob.sharesdk.methodchannel';
 
@@ -109,12 +119,162 @@ function shareTypeFromContentType(typeNum: number): string {
   }
 }
 
+/**
+ * 微信「原始授权码」会话的兜底时长。
+ *
+ * 用户跳到微信后可能再也不回来（直接杀掉微信、或停在微信里很久），这种情况微信
+ * 不会回任何 want。没有兜底的话 Dart 侧的 Completer 永远不完成，用户看到的是
+ * 「点了微信登录之后什么都不发生」——连一句失败提示都没有。
+ */
+const WECHAT_AUTH_CODE_TIMEOUT_MS = 180000;
+
+function makePluginError(message: string): PluginError {
+  const err: PluginError = { message: message };
+  return err;
+}
+
+/**
+ * 微信授权：**绕开 ShareSDK 直接用 `@tencent/wechat_open_sdk` 取原始 code**。
+ *
+ * 为什么不用 ShareSDK 自己的授权（`platform.showUser()` / `platform.authorize()`）：
+ * 底层 `@zztsdk/sharesdk` 的鸿蒙实现有两条硬约束，合起来让「拿原始 code」在鸿蒙上不可能——
+ *
+ * 1. `WechatPlatform.initPlatform` 里 `isTextEmpty(appKey) || isTextEmpty(appSecret)`
+ *    就抛 `wechat init fail,please check appKey and appSecret`：**不配 AppSecret 连初始化都过不去**，
+ *    而 iOS / Android 是「不配 secret 就把 code 原样给你」；
+ * 2. 微信授权回包 `onResp` 里拿到 code 之后**无条件**调 `requestAuthToken(appId, appSecret, code)`
+ *    换 access_token，原始 code 从不落 db（整个 har 里只有 QQ 分支写过 `authCode` 这个 key）。
+ *
+ * 也就是说走 ShareSDK 的话，客户端要么拿不到东西，要么只能拿到 access_token，且必须把
+ * 微信 AppSecret 打进包里。而授权码流的服务端要的正是原始 code，AppSecret 也只该留在服务端。
+ *
+ * 微信官方 SDK 的 `SendAuthReq` 本来就只需要 appId，回包直接带 code——所以登录这条路
+ * 自己发一次 `SendAuthReq` 即可。分享仍然走 ShareSDK（分享不碰 AppSecret）。
+ *
+ * 生命周期：请求发出后本会话挂在 `SharesdkPlugin.pendingWechatAuthCode` 上，
+ * 由 `SharesdkPlugin.handleWant` 在 `onNewWant` 时喂回包；结算后立即摘除。
+ */
+class WechatAuthCodeSession implements WXApiEventHandler {
+  private readonly api: WXApi;
+  private readonly result: MethodResult;
+  private readonly state: string;
+  private readonly onSettled: () => void;
+  private settled: boolean = false;
+  private timerId: number = -1;
+
+  constructor(api: WXApi, result: MethodResult, state: string, onSettled: () => void) {
+    this.api = api;
+    this.result = result;
+    this.state = state;
+    this.onSettled = onSettled;
+    this.timerId = setTimeout(() => {
+      console.warn('[SharesdkPlugin] wechat authCode timeout, treat as cancel');
+      this.settleCancel();
+    }, WECHAT_AUTH_CODE_TIMEOUT_MS);
+  }
+
+  onReq(_req: BaseReq): void {
+  }
+
+  onResp(resp: BaseResp): void {
+    if (!(resp instanceof SendAuthResp)) {
+      return;
+    }
+    const authResp = resp as SendAuthResp;
+    // state 对不上说明这条回包属于别人发起的授权（例如 ShareSDK 自己的微信授权），
+    // 不认领——认领了会把别人的结果当成自己的，还会顺手把本会话结算掉。
+    if (this.state.length > 0 && authResp.state !== undefined && authResp.state !== this.state) {
+      return;
+    }
+    if (authResp.errCode === ErrCode.ERR_USER_CANCEL || authResp.errCode === ErrCode.ERR_AUTH_DENIED) {
+      this.settleCancel();
+      return;
+    }
+    if (authResp.errCode !== ErrCode.ERR_OK) {
+      this.settleFail(`wechat auth failed, errCode=${authResp.errCode}, errStr=${authResp.errStr ?? ''}`);
+      return;
+    }
+    const code: string = authResp.code ?? '';
+    if (code.length === 0) {
+      // 微信返回成功却没有 code，正常不该发生；当失败处理而不是静默成功，
+      // 否则 Dart 侧会拿到一个「成功但空凭证」的结果，更难排查。
+      this.settleFail('wechat auth succeeded but code is empty');
+      return;
+    }
+    const userMap = new Map<string, Object>();
+    // 键名与 iOS 的 `SSDKCredential.authCode`、鸿蒙 db 常量 `consts.KET_AUTH_CODE` 一致，
+    // Dart 侧的凭证适配器认的就是它。
+    userMap.set('authCode', code);
+    if (authResp.openId !== undefined && authResp.openId.length > 0) {
+      userMap.set('openid', authResp.openId);
+    }
+    const okResult: UserInfoResult = { state: 1, user: userMap };
+    this.settle(okResult);
+  }
+
+  /**
+   * 把 newWant 交给微信 SDK 解析。
+   * 返回 true 表示这条 want 确实是微信回包、已被消费，调用方不必再转给 ShareSDK。
+   */
+  handleWant(want: Want): boolean {
+    if (this.settled) {
+      return false;
+    }
+    return this.api.handleWant(want, this);
+  }
+
+  /**
+   * 微信可能不经 `onNewWant` 而直接用 `openLink` 的回调送回包（宿主 `querySchemes`
+   * 声明了 `wxopensdk` 时走这条），那条路只认 `handleWant` 里装上的 eventHandler。
+   * 这里用一个空 want 空跑一次，纯粹为了把 handler 装进去——空 want 没有 parameters，
+   * SDK 会直接返回 false，不会有任何副作用。
+   */
+  installEventHandler(): void {
+    const emptyWant: Want = {};
+    this.api.handleWant(emptyWant, this);
+  }
+
+  settleCancel(): void {
+    const cancelResult: UserInfoResult = { state: 3 };
+    this.settle(cancelResult);
+  }
+
+  settleFail(message: string): void {
+    console.warn(`[SharesdkPlugin] wechat authCode failed: ${message}`);
+    const failResult: UserInfoResult = { state: 2, error: makePluginError(message) };
+    this.settle(failResult);
+  }
+
+  private settle(res: UserInfoResult): void {
+    if (this.settled) {
+      return;
+    }
+    this.settled = true;
+    if (this.timerId !== -1) {
+      clearTimeout(this.timerId);
+      this.timerId = -1;
+    }
+    this.onSettled();
+    this.result.success(res);
+  }
+}
+
 export class SharesdkPlugin implements FlutterPlugin, MethodCallHandler {
   private channel: MethodChannel | null = null;
   private static abilityContext: common.UIAbilityContext | null = null;
   /** 宿主 App 传入的 Mob appKey/appSecret，插件本身不内置任何凭据 */
   private static mobAppKey: string = '';
   private static mobAppSecret: string = '';
+  /**
+   * 微信开放平台 AppID，由 Dart 侧 `regist` 传入时缓存。
+   *
+   * 单独存一份而不是回头找 ShareSDK 要：`ShareSDK.setPlatformDevInfoAsync` 会在
+   * 隐私未授权时**默默丢弃** devInfo（只打一行 `isForbidden use Platform.DEFAULT`），
+   * 而微信授权码这条路根本不经过 ShareSDK，不该被它的授权状态连坐。
+   */
+  private static wechatAppId: string = '';
+  /** 进行中的微信授权码会话；同一时刻只允许一个 */
+  private static pendingWechatAuthCode: WechatAuthCodeSession | null = null;
 
   getUniqueClassName(): string {
     return 'SharesdkPlugin';
@@ -142,6 +302,12 @@ export class SharesdkPlugin implements FlutterPlugin, MethodCallHandler {
   }
 
   static handleWant(want: Want, context: common.UIAbilityContext): void {
+    // 微信授权码会话优先：它是自己发的 SendAuthReq，回包只有它认得。
+    // 消费掉就不再转给 ShareSDK——同一条回包被两边处理会让 ShareSDK 报无主回调。
+    const pending = SharesdkPlugin.pendingWechatAuthCode;
+    if (pending != null && pending.handleWant(want)) {
+      return;
+    }
     mobShare.ShareSDK.getInstance().handlerWant(want, context);
   }
 
@@ -336,6 +502,8 @@ export class SharesdkPlugin implements FlutterPlugin, MethodCallHandler {
       const redirectUri = this.toString(info.get('redirect_uri'));
       if (platformName === mobShare.Platform.Wechat) {
         if (appId.length > 0) {
+          // 授权码这条路只需要 appId，先单独留一份（理由见 wechatAppId 的注释）。
+          SharesdkPlugin.wechatAppId = appId;
           map.set(mobShare.Platform_Info.APP_KEY, appId);
           hasAny = true;
         }
@@ -364,6 +532,70 @@ export class SharesdkPlugin implements FlutterPlugin, MethodCallHandler {
     result.success(null);
   }
 
+  /**
+   * 调用方是否要「微信原始授权码」。
+   *
+   * 复用 Flutter 侧既有的 `getUserInfoWithParam(platform, {"needAuthCode": true}, ...)`
+   * 约定（Android 用它开 `platName.needAuthCode(true)`，iOS 原样透传给原生），
+   * 不另立方法名——这样三端 Dart 代码保持一条路。不传这个开关时行为完全不变，
+   * 仍走 ShareSDK 的 `showUser()`，老接入方不受影响。
+   */
+  private wantsWechatAuthCode(platformName: string, args: Map<string, Object> | null): boolean {
+    if (platformName !== mobShare.Platform.Wechat || args == null) {
+      return false;
+    }
+    const raw = args.get('needAuthCode');
+    if (typeof raw === 'boolean') {
+      return raw as boolean;
+    }
+    return this.toString(raw) === 'true';
+  }
+
+  /** 见 [WechatAuthCodeSession] 的说明：绕开 ShareSDK，自己发一次 SendAuthReq 取 code。 */
+  private async handleWechatAuthCode(result: MethodResult): Promise<void> {
+    const appId = SharesdkPlugin.wechatAppId;
+    if (appId.length === 0) {
+      const noAppId: UserInfoResult = {
+        state: 2,
+        error: this.createError('wechat appId is missing. Call SharesdkPlugin.regist(...) '
+          + 'with ShareSDKRegister.setupWechat(appId, ...) before authorizing.'),
+      };
+      result.success(noAppId);
+      return;
+    }
+    // 上一次授权还没结算（用户切走没回来）时又点了一次：老会话按取消结束。
+    // 留着两个 pending 会让先来的那个抢走回包，表现为「第二次点没反应」。
+    const previous = SharesdkPlugin.pendingWechatAuthCode;
+    if (previous != null) {
+      SharesdkPlugin.pendingWechatAuthCode = null;
+      previous.settleCancel();
+    }
+    const context = await this.getContextAsync();
+    const api = WXAPIFactory.createWXAPI(appId);
+    const state = `ssdk_${Date.now()}`;
+    const session = new WechatAuthCodeSession(api, result, state, () => {
+      if (SharesdkPlugin.pendingWechatAuthCode === session) {
+        SharesdkPlugin.pendingWechatAuthCode = null;
+      }
+    });
+    SharesdkPlugin.pendingWechatAuthCode = session;
+    session.installEventHandler();
+    const req = new SendAuthReq();
+    // 与 ShareSDK 自己的授权取同一个 scope，保证服务端换到的用户信息范围一致。
+    req.scope = 'snsapi_userinfo';
+    req.state = state;
+    try {
+      const sent = await api.sendReq(context, req);
+      if (!sent) {
+        // 拉不起微信（没装 / querySchemes 少了 weixin / 被系统拦下）。
+        session.settleFail('failed to launch WeChat for authorization');
+      }
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      session.settleFail(`sendReq failed: ${message}`);
+    }
+  }
+
   private async handleGetUserInfo(call: MethodCall, result: MethodResult): Promise<void> {
     const args = this.asMap(call.args);
     const platformId = args != null ? this.toNumber(args.get('platform'), -1) : -1;
@@ -371,6 +603,10 @@ export class SharesdkPlugin implements FlutterPlugin, MethodCallHandler {
     if (platformName == null) {
       const unsupported: UserInfoResult = { state: 2, error: this.createError('unsupported platform') };
       result.success(unsupported);
+      return;
+    }
+    if (this.wantsWechatAuthCode(platformName, args)) {
+      await this.handleWechatAuthCode(result);
       return;
     }
     const context = await this.getContextAsync();
@@ -521,6 +757,10 @@ export class SharesdkPlugin implements FlutterPlugin, MethodCallHandler {
     const platformName = platformNameFromId(platformId);
     if (platformName == null) {
       result.success(this.createActionResult(2, 'unsupported platform'));
+      return;
+    }
+    if (this.wantsWechatAuthCode(platformName, args)) {
+      await this.handleWechatAuthCode(result);
       return;
     }
     const context = await this.getContextAsync();
